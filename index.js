@@ -88,7 +88,7 @@ app.get('/get-votes', (req, res) => {
 });
 
 // Поставить лайк или дизлайк
-app.post('cast-vote', (req, res) => {
+app.post('/cast-vote', (req, res) => {
     const { name, action } = req.body;
 
     if (!name) 
