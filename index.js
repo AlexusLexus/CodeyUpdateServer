@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs');
-const path = require('path');
 const cors = require('cors');
+const admin = require('firebase-admin');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -9,37 +9,23 @@ const port = process.env.PORT || 3000;
 app.use(express.json());
 app.use(cors());
 
-const countersFilePath = path.join(__dirname, 'counters.json');
+admin.initializeApp({
+    credential: admin.credential.cert({
+        type: 'service_account',
+        project_id: process.env.FIREBASE_PROJECT_ID,
+        private_key_id: process.env.FIREBASE_PRIVATE_KEY_ID,
+        private_key: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+        client_email: process.env.FIREBASE_CLIENT_EMAIL,
+        client_id: process.env.FIREBASE_CLIENT_ID,
+        auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+        token_uri: 'https://oauth2.googleapis.com/token',
+        auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+        client_x509_cert_url: process.env.FIREBASE_CLIENT_X509_CERT_URL,
+    }),
+    databaseURL: process.env.FIREBASE_DATABASE_URL,
+});
 
-// Инициализация файла счетчиков, если он не существует
-if (!fs.existsSync(countersFilePath)) 
-{
-    fs.writeFileSync(countersFilePath, JSON.stringify({}, null, 2)); // Пустой объект для хранения счетчиков
-}
-
-function getCounters() 
-{
-    const data = fs.readFileSync(countersFilePath, 'utf8');
-    return JSON.parse(data);
-}
-
-function setCounters(counters) 
-{
-    fs.writeFileSync(countersFilePath, JSON.stringify(counters, null, 2));
-}
-
-function getCounterByName(name)
-{
-    const counters = getCounters();
-    return counters[name] || 0; // Если счетчик не существует, вернуть 0
-}
-
-function setCounterByName(name, value)
-{
-    const counters = getCounters();
-    counters[name] = value;
-    setCounters(counters);
-}
+const db = admin.database();
 
 app.get('/version-check', (req, res) => {
     // приложение, тип сборки
@@ -58,7 +44,8 @@ app.get('/version-check', (req, res) => {
             {
                 return res.json({
                     version: "1.0.0",
-                    pak_link: "example.com/codey_final_100.zip"
+                    pak_link: "example.com/codey_final_100.zip",
+                    patch_notes_link: "example.com/codey_final_patch_notes_100.ybn"
                 });
             }
             // для превью и сборок в разработке
@@ -66,7 +53,8 @@ app.get('/version-check', (req, res) => {
             {
                 return res.json({
                     version: "1.0.0",
-                    pak_link: "example.com/codey_preview_100.zip"
+                    pak_link: "example.com/codey_preview_100.zip",
+                    patch_notes_link: "example.com/codey_preview_patch_notes_100.ybn"
                 });
             }
             break;
@@ -77,46 +65,100 @@ app.get('/version-check', (req, res) => {
 });
 
 // Получить кол-во голосов на посте
-app.get('/get-votes', (req, res) => {
+app.get('/get-votes', async (req, res) => {
     const { name } = req.query;
 
-    if (!name) 
-    {
+    if (!name) {
         return res.status(400).json({ error: "Param 'name' is required!" });
     }
 
-    const counter = getCounterByName(name);
-    return res.json({ name, counter });
+    const ref = db.ref('counters/' + name);
+    try {
+        const snapshot = await ref.once('value');
+        const data = snapshot.val();
+
+        if (!data) {
+            return res.status(404).json({ error: "Counter not found!" });
+        }
+
+        return res.json({ name, votes: data.votes });
+    } catch (err) {
+        return res.status(500).json({ error: 'Error fetching data', details: err.message });
+    }
 });
 
 // Поставить лайк или дизлайк
-app.post('/cast-vote', (req, res) => {
-    const { name, action } = req.body;
+app.post('/cast-vote', async (req, res) => {
+    const { name, action, user } = req.body;
 
-    if (!name) 
-    {
-        return res.status(400).json({ error: "Param 'name' is required!" });
+    if (!name || !action || !user) {
+        return res.status(400).json({ error: "Params 'name', 'action', and 'user' are required!" });
     }
 
-    if (!['up', 'down'].includes(action)) 
-    {
+    // Ensure action is either "up" or "down"
+    if (!['up', 'down'].includes(action)) {
         return res.status(400).json({ error: "Invalid action. Use 'up' or 'down'." });
     }
 
-    let counter = getCounterByName(name);
+    const ref = db.ref('counters/' + name);
+    const counterSnapshot = await ref.once('value');
+    const counterData = counterSnapshot.val();
 
-    if (action === 'up') 
-    {
-        counter += 1;
-    } 
-    else if (action === 'down') 
-    {
-        counter -= 1;
+    if (!counterData) {
+        return res.status(404).json({ error: "Counter not found!" });
     }
 
-    setCounterByName(name, counter);
+    // Check if user has already voted
+    if (counterData.users && counterData.users[user]) {
+        return res.status(400).json({ error: "User has already voted on this counter." });
+    }
 
-    return res.json({ name, counter });
+    // Update the vote count based on the action
+    let votes = counterData.votes || 0;
+    if (action === 'up') {
+        votes += 1;
+    } else if (action === 'down') {
+        votes -= 1;
+    }
+
+    // Update the vote count and user vote in Firebase
+    const updates = {};
+    updates[`counters/${name}/votes`] = votes;
+    updates[`counters/${name}/users/${user}`] = action;
+
+    try {
+        await ref.update(updates); // Update votes and user vote
+        return res.json({ name, action, votes });
+    } catch (err) {
+        return res.status(500).json({ error: 'Error updating vote', details: err.message });
+    }
+});
+
+app.get('/who-voted-what', async (req, res) => {
+    const { name, user } = req.query;
+
+    if (!name || !user) {
+        return res.status(400).json({ error: "Params 'name' and 'user' are required!" });
+    }
+
+    const ref = db.ref('counters/' + name);
+    const counterSnapshot = await ref.once('value');
+    const counterData = counterSnapshot.val();
+
+    if (!counterData || !counterData.users || !counterData.users[user]) {
+        return res.status(404).json({ error: "User has not voted or counter not found!" });
+    }
+
+    return res.json({ user, voted: counterData.users[user] });
+});
+
+// Проверяем включено ли голосование за пост
+app.get('/is-voting-enabled', (req, res) => {
+    return res.json(
+    {
+        status: true
+    }
+);
 });
 
 // сервак
